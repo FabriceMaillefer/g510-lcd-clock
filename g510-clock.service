@@ -1,0 +1,10 @@
+[Unit]
+Description=Horloge sur l'écran LCD du Logitech G510
+
+[Service]
+ExecStart=/usr/bin/python3 %h/Documents/G510/g510_clock.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
