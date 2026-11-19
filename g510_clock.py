@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Horloge, CPU et RAM sur l'écran LCD (160x43, monochrome) d'un Logitech G510.
+"""Horloge, CPU, RAM et GPU sur l'écran LCD (160x43, monochrome) d'un Logitech G510.
 
 Écrit directement dans le /dev/hidraw de l'interface 1 du clavier (rapport de
 sortie n°3, 991 octets). Pas besoin de libg15/libusb : le pilote noyau
 hid-lg-g15 reste attaché, les touches G et le rétroéclairage continuent de
 fonctionner.
 
-Touches :
-    MR (ou M1) / M2 / M3  écran horloge / CPU / RAM (la LED indique l'écran actif)
+Écrans : horloge, CPU, RAM, GPU (NVIDIA, via nvidia-smi).
+
+Touches (les touches M1-M3 et MR ne sont pas utilisées, leurs LED restent éteintes) :
     bouton rond         écran suivant
     boutons sous l'écran, de gauche à droite :
         1  écran précédent     2  écran suivant
@@ -18,6 +19,7 @@ Usage :
     ./g510_clock.py --test     # motif de test (cadre + damier)
     ./g510_clock.py --clear    # efface l'écran
     ./g510_clock.py --keys     # affiche les appuis bruts (débogage)
+    ./g510_clock.py -v         # affiche chaque appui pris en compte
 """
 import argparse
 import collections
@@ -26,7 +28,9 @@ import fcntl
 import glob
 import os
 import select
+import shutil
 import signal
+import subprocess
 import sys
 import time
 
@@ -37,14 +41,14 @@ REPORT_LEN = 992          # 1 octet d'ID de rapport (0x03) + 991 octets
 LCD_OFFSET = 32           # les pixels commencent à l'octet 32
 G510_IDS = ("0000046D:0000C22D", "0000046D:0000C22E")  # G510 / G510 (mode audio)
 
-# Rapport d'entrée n°3 (5 octets) : touches G, M, MR et boutons de l'écran
+# Rapport d'entrée n°3 (5 octets) : touches G, M, MR et boutons de l'écran.
+# Seul l'octet 4 (boutons de l'écran) est utilisé.
 KEY_REPORT = 0x03
-M_KEYS = {0x10: 0, 0x80: 0, 0x20: 1, 0x40: 2}  # octet 3 -> écran (M1 et MR : horloge)
 LCD_ROUND, LCD_1, LCD_2, LCD_3, LCD_4 = 0x01, 0x02, 0x04, 0x08, 0x10  # octet 4
 
-# Rapport « feature » n°4 : LED des touches M (M1=0x80, M2=0x40, M3=0x20, MR=0x10)
+# Rapport « feature » n°4 : LED des touches M (M1=0x80, M2=0x40, M3=0x20, MR=0x10).
+# Les touches M ne sont pas utilisées : on éteint leurs LED au démarrage.
 M_LEDS_REPORT = 0x04
-M_LED_MASKS = (0x80 | 0x10, 0x40, 0x20)  # horloge : LED M1 + MR
 DEBOUNCE = 0.10           # s de relâchement minimal entre deux appuis
 
 FONT_DIR = "/usr/share/fonts/TTF/"
@@ -181,6 +185,74 @@ class MemMonitor:
         return 100.0 * self.used / self.info["MemTotal"]
 
 
+def _num(v):
+    try:
+        return float(v)
+    except ValueError:            # "[N/A]", "[Not Supported]"...
+        return None
+
+
+class GpuMonitor:
+    """Mesures d'un GPU NVIDIA via nvidia-smi (aucune dépendance Python).
+
+    nvidia-smi n'est appelé que lorsque l'écran GPU est affiché : l'interroger
+    en permanence empêcherait un GPU de portable hybride de se mettre en
+    veille. S'il est déjà en veille, on ne le réveille pas.
+    """
+    FIELDS = ("temperature.gpu", "utilization.gpu", "memory.used", "memory.total",
+              "power.draw", "clocks.gr", "fan.speed", "pstate")
+
+    def __init__(self):
+        self.smi = shutil.which("nvidia-smi")
+        self.pci = self._find_pci()
+        self.data = {}
+        self.status = None        # message à afficher à la place des mesures
+        self.history = collections.deque([0.0] * HISTORY, maxlen=HISTORY)
+
+    @staticmethod
+    def _find_pci():
+        for dev in glob.glob("/sys/bus/pci/devices/*"):
+            try:
+                vendor = open(os.path.join(dev, "vendor")).read().strip()
+                cls = open(os.path.join(dev, "class")).read().strip()
+            except OSError:
+                continue
+            if vendor == "0x10de" and cls.startswith("0x03"):
+                return dev
+        return None
+
+    def _suspended(self):
+        if not self.pci:
+            return False
+        try:
+            return open(os.path.join(self.pci, "power/runtime_status")).read().strip() == "suspended"
+        except OSError:
+            return False
+
+    def sample(self):
+        if not self.smi:
+            self.status = "nvidia-smi absent"
+            return
+        if self._suspended():
+            self.status = "GPU en veille"
+            self.history.append(0.0)
+            return
+        try:
+            out = subprocess.run(
+                [self.smi, "--query-gpu=" + ",".join(self.FIELDS),
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=2).stdout
+            vals = [v.strip() for v in out.splitlines()[0].split(",")]
+        except (OSError, IndexError, subprocess.TimeoutExpired):
+            vals = []
+        if len(vals) != len(self.FIELDS):
+            self.status = "nvidia-smi : erreur"
+            return
+        self.data = {k: (v if k == "pstate" else _num(v)) for k, v in zip(self.FIELDS, vals)}
+        self.status = None
+        self.history.append(self.data["utilization.gpu"] or 0.0)
+
+
 # --------------------------------------------------------------------------
 # Dessin
 # --------------------------------------------------------------------------
@@ -287,6 +359,43 @@ def render_ram(d, mem, fonts, alt):
         text_at(d, W - 1, y, val, fonts.small, right=True)
 
 
+def render_gpu(d, gpu, fonts, alt):
+    g = gpu.data
+    if gpu.status or not g:
+        text_at(d, 0, 0, "GPU", fonts.small)
+        text_centered(d, 20, gpu.status or "lecture…", fonts.text)
+        return
+    util, temp, power = g["utilization.gpu"], g["temperature.gpu"], g["power.draw"]
+    text_at(d, 0, 0, f"GPU {util:3.0f}%" if util is not None else "GPU", fonts.small)
+    info = []
+    if temp is not None:
+        info.append(f"{temp:.0f}°C")
+    if power is not None:
+        info.append(f"{power:.0f}W")
+    text_at(d, W - 1, 0, " ".join(info), fonts.small, right=True)
+
+    if not alt:
+        graph(d, gpu.history, 11, H - 1)
+        return
+    used, total = g["memory.used"], g["memory.total"]
+    rows = [("util", util or 0, f"{util or 0:.0f}%")]
+    if used is not None and total:
+        rows.append(("vram", 100 * used / total, f"{used / 1024:.1f}"))
+    for n, (label, pct, val) in enumerate(rows):
+        y = 12 + n * 10
+        text_at(d, 0, y, label, fonts.small)
+        bar(d, 34, y, 124, y + 7, pct)
+        text_at(d, W - 1, y, val, fonts.small, right=True)
+    extra = []
+    if g["clocks.gr"] is not None:
+        extra.append(f"{g['clocks.gr']:.0f} MHz")
+    if g["pstate"]:
+        extra.append(g["pstate"])
+    if g["fan.speed"] is not None:
+        extra.append(f"vent. {g['fan.speed']:.0f}%")
+    text_at(d, 0, 32, "  ".join(extra), fonts.small)
+
+
 def render_test():
     img = Image.new("1", (W, H), 0)
     d = ImageDraw.Draw(img)
@@ -302,7 +411,7 @@ def render_test():
 # --------------------------------------------------------------------------
 
 class App:
-    SCREENS = ("horloge", "cpu", "ram")
+    SCREENS = ("horloge", "cpu", "ram", "gpu")
 
     def __init__(self, device, verbose=False):
         self.device = device
@@ -311,11 +420,12 @@ class App:
         self.screen = 0
         self.alt = [False] * len(self.SCREENS)
         self.invert = False
-        self.prev_keys = (0, 0)
+        self.prev_keys = (0,)
         self.released_at = {}
         self.fonts = Fonts()
         self.cpu = CpuMonitor()
         self.mem = MemMonitor()
+        self.gpu = GpuMonitor()
 
     def open(self):
         while True:
@@ -323,31 +433,31 @@ class App:
             if dev:
                 try:
                     self.fd = os.open(dev, os.O_RDWR | os.O_NONBLOCK)
-                    self.update_leds()
+                    set_m_leds(self.fd, 0)
                     return
                 except OSError:
                     pass
             time.sleep(2)
 
-    def update_leds(self):
-        set_m_leds(self.fd, M_LED_MASKS[self.screen])
-
     def render(self):
         img = Image.new("1", (W, H), 0)
         d = ImageDraw.Draw(img)
         alt = self.alt[self.screen]
-        if self.screen == 0:
+        name = self.SCREENS[self.screen]
+        if name == "horloge":
             render_clock(d, datetime.datetime.now(), self.fonts, alt)
-        elif self.screen == 1:
+        elif name == "cpu":
             render_cpu(d, self.cpu, self.fonts, alt)
-        else:
+        elif name == "ram":
             render_ram(d, self.mem, self.fonts, alt)
+        else:
+            render_gpu(d, self.gpu, self.fonts, alt)
         if self.invert:
             img = ImageOps.invert(img.convert("L")).convert("1")
         os.write(self.fd, image_to_report(img))
 
     def debounce(self, *state):
-        """Retourne, pour les octets 3 et 4, les bits nouvellement enfoncés.
+        """Retourne, pour chaque octet donné, les bits nouvellement enfoncés.
 
         Les contacts du G510 rebondissent (rafales enfoncé/relâché espacées de
         20-40 ms, à l'appui comme au relâchement). Un appui ne compte que si la
@@ -371,11 +481,9 @@ class App:
     def on_report(self, data):
         if len(data) != 5 or data[0] != KEY_REPORT:
             return
-        down3, down4 = self.debounce(data[3], data[4])
+        (down4,) = self.debounce(data[4])
         n = len(self.SCREENS)
-        for mask, idx in M_KEYS.items():
-            if down3 & mask:
-                self.screen = idx
+        before = self.screen
         if down4 & (LCD_ROUND | LCD_2):
             self.screen = (self.screen + 1) % n
         if down4 & LCD_1:
@@ -384,11 +492,12 @@ class App:
             self.alt[self.screen] = not self.alt[self.screen]
         if down4 & LCD_4:
             self.invert = not self.invert
-        if self.verbose and (down3 or down4):
-            print(f"appui octet3={down3:02x} octet4={down4:02x} -> écran {self.SCREENS[self.screen]}"
+        if self.verbose and down4:
+            print(f"appui octet4={down4:02x} -> écran {self.SCREENS[self.screen]}"
                   f" alt={self.alt[self.screen]} invert={self.invert}", flush=True)
-        if down3 or down4:
-            self.update_leds()
+        if down4:
+            if self.screen != before and self.SCREENS[self.screen] == "gpu":
+                self.gpu.sample()     # mesures fraîches dès l'arrivée sur l'écran
             self.render()
 
     def shutdown(self, *_):
@@ -411,6 +520,8 @@ class App:
                 if now >= next_tick:
                     self.cpu.sample()
                     self.mem.sample()
+                    if self.SCREENS[self.screen] == "gpu":
+                        self.gpu.sample()
                     self.render()
                     # se caler juste après le changement de seconde
                     next_tick = now + 1 - datetime.datetime.now().microsecond / 1e6 + 0.01
